@@ -7,15 +7,25 @@ package shmringbuffer
 
 /*
 #cgo CFLAGS: -I.
-#cgo LDFLAGS: -lpthread
+#cgo LDFLAGS: -L. -lshmringbuffer -lpthread
 
-#include <errno.h>   // For errno
+// The LDFLAGS above instruct CGo to link against libshmringbuffer.so.
+// -L. adds the current directory (where shmringbuffer.go resides, and where
+// libshmringbuffer.so is expected to be placed by the Makefile) to the library search path.
+// -lshmringbuffer links against the library named 'shmringbuffer' (libshmringbuffer.so).
+// -lpthread is still needed for the POSIX semaphore functions used by the C library.
+
+// Standard C headers needed for CGo to interact with C types or error handling.
+#include <errno.h>   // For errno, used by C.GoString(C.strerror(C.int(*C.__errno_location())))
 #include <string.h>  // For strerror
-#include <stdio.h>   // For C.stderr in ShmRingBuffer.Destroy
+#include <stdio.h>   // For C.stderr, if used directly in Go for debug prints from C context
 
-#include "shm_utils.h"    // For key_t definition
-#include "ringbuffer.h"   // Includes shm_ringbuffer.h
-#include "cgo_wrapper.h"  // Declarations for CGo_ functions
+// cgo_wrapper.h contains all CGo_* function declarations.
+// This header must be self-contained or include other necessary headers
+// (like sys/types.h for key_t, stddef.h for size_t) for the function
+// signatures it declares, so CGo can understand the C API surface.
+// Our cgo_wrapper.h is set up this way.
+#include "cgo_wrapper.h"
 */
 import "C"
 
