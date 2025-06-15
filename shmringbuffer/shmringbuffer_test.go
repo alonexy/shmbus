@@ -323,3 +323,306 @@ func TestWriteTooLarge(t *testing.T) {
 func init() {
 	rand.Seed(time.Now().UnixNano())
 }
+
+// (Existing imports and helper functions in shmringbuffer_test.go remain)
+
+func TestMultipleReaders(t *testing.T) {
+	key := getTestKey()
+	dataSize := uint64(1024) // Sufficiently large buffer
+	numMessages := 100
+	numReaders := 5
+
+	rb, err := Create(key, dataSize)
+	if err != nil {
+		t.Fatalf("Create() failed: %v", err)
+	}
+	t.Cleanup(func() { rb.Destroy() })
+
+	var messages [][]byte
+	for i := 0; i < numMessages; i++ {
+		messages = append(messages, []byte(fmt.Sprintf("Message-%d-%s", i, string(make([]byte, rand.Intn(50)+10))))) // Random length
+	}
+
+	var wg sync.WaitGroup
+	errChan := make(chan error, numReaders)
+
+	for rN := 0; rN < numReaders; rN++ {
+		wg.Add(1)
+		go func(readerNum int) {
+			defer wg.Done()
+			t.Logf("Reader %d: Starting", readerNum)
+			reader, err := rb.RegisterReader()
+			if err != nil {
+				errChan <- fmt.Errorf("reader %d RegisterReader() failed: %w", readerNum, err)
+				return
+			}
+			defer reader.Close()
+			t.Logf("Reader %d: Registered", readerNum)
+
+			readBuf := make([]byte, 256) // Max message size expected around 60-70 bytes
+			for msgIdx, expectedMsg := range messages {
+				// Add a timeout to prevent test hanging indefinitely if read blocks unexpectedly
+				timeout := time.After(5 * time.Second) // Generous timeout
+				var readN int
+				var readErr error
+
+				select {
+				case <- func() chan struct{} { // Anonymous func to do the read
+					doneRead := make(chan struct{})
+					go func() {
+						readN, readErr = reader.Read(readBuf)
+						close(doneRead)
+					}()
+					return doneRead
+				}():
+					// Read completed
+				case <-timeout:
+					errChan <- fmt.Errorf("reader %d Read() message %d timed out", readerNum, msgIdx)
+					return
+				}
+
+				if readErr != nil {
+					errChan <- fmt.Errorf("reader %d Read() message %d failed: %w", readerNum, msgIdx, readErr)
+					return
+				}
+				if readN != len(expectedMsg) {
+					errChan <- fmt.Errorf("reader %d Read() message %d: read %d bytes, expected %d. Got: %q, Expected: %q",
+						readerNum, msgIdx, readN, len(expectedMsg), readBuf[:readN], expectedMsg)
+					return
+				}
+				if !bytes.Equal(readBuf[:readN], expectedMsg) {
+					errChan <- fmt.Errorf("reader %d Read() message %d: data mismatch.\nExpected: %q\nGot:      %q",
+						readerNum, msgIdx, expectedMsg, readBuf[:readN])
+					return
+				}
+				t.Logf("Reader %d: Successfully read message %d (%s...)", readerNum, msgIdx, string(expectedMsg[:min(10, len(expectedMsg))]))
+			}
+			t.Logf("Reader %d: Finished reading all messages", readerNum)
+		}(rN)
+	}
+
+	// Writer goroutine (or main test goroutine can be the writer)
+	t.Log("Writer: Starting to write messages")
+	for i, msg := range messages {
+		written, err := rb.Write(msg)
+		if err != nil {
+			t.Fatalf("Writer: Write() message %d failed: %v", i, err)
+		}
+		if written != len(msg) {
+			t.Fatalf("Writer: Write() message %d: wrote %d bytes, expected %d", i, written, len(msg))
+		}
+		t.Logf("Writer: Wrote message %d (%s...)", i, string(msg[:min(10, len(msg))]))
+		// time.Sleep(5 * time.Millisecond) // Small delay to allow readers to catch up slightly if desired
+	}
+	t.Log("Writer: Finished writing all messages")
+
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		if err != nil {
+			t.Error(err) // Report all errors from reader goroutines
+		}
+	}
+	if t.Failed() {
+		t.Fatal("One or more readers failed.")
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+
+func TestBufferFullAndEmptyBlocking(t *testing.T) {
+	key := getTestKey()
+	// Small buffer, e.g., capacity for 2 messages of 10 bytes + headers.
+	// Let's say each message is "0123456789" (10 bytes).
+	// DataSize should be small. Header + ReaderInfoArray + Data.
+	// Header ~32-40 bytes (depending on semaphore sizes), ReaderInfoArray for 10 readers ~ 10 * (8+8+4) = 200 bytes.
+	// This is too large. The C.CGo_GetHeaderSize() and C.CGo_GetReaderInfoArraySize() are key.
+	// Let's assume simple message size of 10 bytes.
+	// To make it simple, let's make dataSize = 25 bytes, enough for two 10-byte messages, with some room.
+	dataSize := uint64(25)
+	msg1 := []byte("message_01") // 10 bytes
+	msg2 := []byte("message_02") // 10 bytes
+	msg3 := []byte("message_03") // 10 bytes (this one should initially block writer)
+	msg4 := []byte("message_04") // 10 bytes (for reader blocking test)
+
+
+	rb, err := Create(key, dataSize)
+	if err != nil {
+		t.Fatalf("Create() failed: %v", err)
+	}
+	t.Cleanup(func() { rb.Destroy() })
+
+	reader, err := rb.RegisterReader()
+	if err != nil {
+		t.Fatalf("RegisterReader() failed: %v", err)
+	}
+	t.Cleanup(func() { reader.Close() })
+
+	// --- Phase 1: Test Writer Blocking ---
+	t.Log("Phase 1: Testing Writer Blocking")
+	// Write msg1
+	if _, err := rb.Write(msg1); err != nil {
+		t.Fatalf("Write msg1 failed: %v", err)
+	}
+	t.Logf("Wrote msg1 (%d bytes)", len(msg1))
+	// Write msg2, buffer should be nearly full (20/25 bytes used)
+	if _, err := rb.Write(msg2); err != nil {
+		t.Fatalf("Write msg2 failed: %v", err)
+	}
+	t.Logf("Wrote msg2 (%d bytes), buffer nearly full", len(msg2))
+
+	writerBlocked := make(chan struct{})
+	writerUnblockedAndDone := make(chan error)
+
+	go func() {
+		t.Log("Writer goroutine: Attempting to write msg3 (should block)...")
+		close(writerBlocked) // Signal that writer is about to attempt the blocking write
+		if _, err := rb.Write(msg3); err != nil {
+			writerUnblockedAndDone <- fmt.Errorf("write msg3 failed after unblock: %w", err)
+			return
+		}
+		t.Log("Writer goroutine: Write msg3 successful (unblocked).")
+		writerUnblockedAndDone <- nil
+	}()
+
+	<-writerBlocked // Wait for writer goroutine to be ready to block
+	t.Log("Main: Writer goroutine is now attempting to write msg3.")
+
+	// Give a moment for the writer to actually block on the semaphore
+	time.Sleep(100 * time.Millisecond)
+	t.Log("Main: Assuming writer is blocked. Reader will now read msg1.")
+
+	readBuf1 := make([]byte, len(msg1))
+	if n, err := reader.Read(readBuf1); err != nil || n != len(msg1) || !bytes.Equal(readBuf1, msg1) {
+		t.Fatalf("Reader: Failed to read msg1. Read %d, err %v, data %q", n, err, readBuf1)
+	}
+	t.Log("Main: Reader read msg1. Writer should unblock soon.")
+
+	select {
+	case err := <-writerUnblockedAndDone:
+		if err != nil {
+			t.Fatalf("Phase 1 failed: %v", err)
+		}
+		t.Log("Phase 1: Writer successfully unblocked and wrote msg3.")
+	case <-time.After(2 * time.Second): // Timeout for writer to unblock
+		t.Fatal("Phase 1 failed: Writer did not unblock after reader read.")
+	}
+
+	// --- Phase 2: Test Reader Blocking ---
+	t.Log("Phase 2: Testing Reader Blocking")
+	// Reader has read msg1. msg2 and msg3 are in buffer.
+	// Read msg2
+	readBuf2 := make([]byte, len(msg2))
+	if n, err := reader.Read(readBuf2); err != nil || n != len(msg2) || !bytes.Equal(readBuf2, msg2) {
+		t.Fatalf("Reader: Failed to read msg2. Read %d, err %v, data %q", n, err, readBuf2)
+	}
+	t.Log("Reader read msg2.")
+	// Read msg3
+	readBuf3 := make([]byte, len(msg3))
+	if n, err := reader.Read(readBuf3); err != nil || n != len(msg3) || !bytes.Equal(readBuf3, msg3) {
+		t.Fatalf("Reader: Failed to read msg3. Read %d, err %v, data %q", n, err, readBuf3)
+	}
+	t.Log("Reader read msg3. Buffer should now be empty.")
+
+	readerBlockedChan := make(chan struct{})
+	readerUnblockedAndDoneChan := make(chan error)
+
+	go func() {
+		t.Log("Reader goroutine: Attempting to read msg4 (should block)...")
+		close(readerBlockedChan)
+		readBuf4 := make([]byte, len(msg4))
+		n, err := reader.Read(readBuf4)
+		if err != nil {
+			readerUnblockedAndDoneChan <- fmt.Errorf("reader goroutine Read msg4 failed: %w", err)
+			return
+		}
+		if n != len(msg4) || !bytes.Equal(readBuf4, msg4) {
+			readerUnblockedAndDoneChan <- fmt.Errorf("reader goroutine Read msg4 data mismatch: read %d, data %q", n, readBuf4)
+			return
+		}
+		t.Log("Reader goroutine: Read msg4 successful (unblocked).")
+		readerUnblockedAndDoneChan <- nil
+	}()
+
+	<-readerBlockedChan
+	t.Log("Main: Reader goroutine is now attempting to read (should be blocked).")
+	time.Sleep(100 * time.Millisecond) // Give reader time to block
+
+	t.Log("Main: Writer writing msg4...")
+	if _, err := rb.Write(msg4); err != nil {
+		t.Fatalf("Main: Write msg4 failed: %v", err)
+	}
+	t.Log("Main: Writer wrote msg4. Reader should unblock.")
+
+	select {
+	case err := <-readerUnblockedAndDoneChan:
+		if err != nil {
+			t.Fatalf("Phase 2 failed: %v", err)
+		}
+		t.Log("Phase 2: Reader successfully unblocked and read msg4.")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Phase 2 failed: Reader did not unblock after writer wrote.")
+	}
+}
+
+
+func TestReaderRegistrationMax(t *testing.T) {
+	key := getTestKey()
+	dataSize := uint64(100)
+	rb, err := Create(key, dataSize)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	t.Cleanup(func() { rb.Destroy() })
+
+	maxCReaders := int(C.CGo_GetMaxReaders())
+	if maxCReaders <= 0 {
+		t.Fatalf("C.CGo_GetMaxReaders() returned invalid value: %d", maxCReaders)
+	}
+	t.Logf("Max readers from C: %d", maxCReaders)
+
+	var readers []*Reader
+	for i := 0; i < maxCReaders; i++ {
+		r, err := rb.RegisterReader()
+		if err != nil {
+			t.Fatalf("RegisterReader() #%d failed: %v", i+1, err)
+		}
+		readers = append(readers, r)
+	}
+
+	// Try to register one more, should fail
+	_, err = rb.RegisterReader()
+	if !errors.Is(err, ErrRegisterReaderFailed) {
+		t.Errorf("RegisterReader() beyond max: expected ErrRegisterReaderFailed, got %v", err)
+	}
+
+	// Unregister one reader
+	if len(readers) > 0 {
+		err = readers[0].Close()
+		if err != nil {
+			t.Fatalf("readers[0].Close() failed: %v", err)
+		}
+		readers = readers[1:] // Remove from slice for bookkeeping
+	}
+
+	// Should be able to register one more now
+	rNew, err := rb.RegisterReader()
+	if err != nil {
+		t.Errorf("RegisterReader() after unregistering one failed: %v", err)
+	} else {
+		t.Logf("Successfully registered a new reader after one was closed.")
+		readers = append(readers, rNew) // Add for cleanup
+	}
+
+	// Cleanup all registered readers
+	for _, r := range readers {
+		r.Close()
+	}
+}
